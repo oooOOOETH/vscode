@@ -119,8 +119,15 @@ export function registerNewChatActions() {
 					when: ContextKeyExpr.equals('view', EditsViewId),
 					group: 'navigation',
 					order: -1
-				},
-				]
+				}],
+				keybinding: {
+					weight: KeybindingWeight.WorkbenchContrib,
+					primary: KeyMod.CtrlCmd | KeyCode.KeyL,
+					mac: {
+						primary: KeyMod.WinCtrl | KeyCode.KeyL
+					},
+					when: ContextKeyExpr.and(ChatContextKeys.inChatSession, ChatContextKeys.location.isEqualTo(ChatAgentLocation.EditingSession))
+				}
 			});
 		}
 
@@ -181,7 +188,7 @@ export function registerNewChatActions() {
 				announceChatCleared(accessibilitySignalService);
 				const widget = widgetService.getWidgetBySessionId(context.sessionId);
 				if (widget) {
-					chatEditingService.currentEditingSessionObs.get()?.stop();
+					await chatEditingService.currentEditingSessionObs.get()?.stop(true);
 					widget.clear();
 					widget.attachmentModel.clear();
 					widget.focusInput();
@@ -192,7 +199,7 @@ export function registerNewChatActions() {
 				const widget = chatView.widget;
 
 				announceChatCleared(accessibilitySignalService);
-				chatEditingService.currentEditingSessionObs.get()?.stop();
+				await chatEditingService.currentEditingSessionObs.get()?.stop(true);
 				widget.clear();
 				widget.attachmentModel.clear();
 				widget.focusInput();
@@ -308,7 +315,6 @@ export function registerNewChatActions() {
 				title: localize2('chat.openEdits.label', "Open {0}", 'Copilot Edits'),
 				category: CHAT_CATEGORY,
 				icon: Codicon.goToEditingSession,
-				precondition: ContextKeyExpr.and(ChatContextKeys.enabled, ChatContextKeys.editingParticipantRegistered),
 				f1: true,
 				menu: [{
 					id: MenuId.ViewTitle,
@@ -322,7 +328,6 @@ export function registerNewChatActions() {
 					order: 1
 				}, {
 					id: MenuId.ChatCommandCenter,
-					when: ChatContextKeys.editingParticipantRegistered,
 					group: 'a_open',
 					order: 2
 				}, {

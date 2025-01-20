@@ -3,12 +3,19 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { CancellationToken } from '../../../../../base/common/cancellation.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { KeyCode, KeyMod } from '../../../../../base/common/keyCodes.js';
 import { basename } from '../../../../../base/common/resources.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { isCodeEditor } from '../../../../../editor/browser/editorBrowser.js';
 import { ServicesAccessor } from '../../../../../editor/browser/editorExtensions.js';
+import { Position } from '../../../../../editor/common/core/position.js';
+import { EditorContextKeys } from '../../../../../editor/common/editorContextKeys.js';
+import { isLocation, Location } from '../../../../../editor/common/languages.js';
+import { ITextModel } from '../../../../../editor/common/model.js';
+import { ILanguageFeaturesService } from '../../../../../editor/common/services/languageFeatures.js';
+import { ITextModelService } from '../../../../../editor/common/services/resolverService.js';
 import { localize, localize2 } from '../../../../../nls.js';
 import { Action2, MenuId, registerAction2 } from '../../../../../platform/actions/common/actions.js';
 import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
@@ -21,7 +28,7 @@ import { GroupsOrder, IEditorGroupsService } from '../../../../services/editor/c
 import { IEditorService } from '../../../../services/editor/common/editorService.js';
 import { ChatAgentLocation } from '../../common/chatAgents.js';
 import { ChatContextKeys } from '../../common/chatContextKeys.js';
-import { applyingChatEditsFailedContextKey, CHAT_EDITING_MULTI_DIFF_SOURCE_RESOLVER_SCHEME, chatEditingResourceContextKey, chatEditingWidgetFileStateContextKey, decidedChatEditingResourceContextKey, hasAppliedChatEditsContextKey, hasUndecidedChatEditingResourceContextKey, IChatEditingService, IChatEditingSession, WorkingSetEntryRemovalReason, WorkingSetEntryState } from '../../common/chatEditingService.js';
+import { applyingChatEditsFailedContextKey, CHAT_EDITING_MULTI_DIFF_SOURCE_RESOLVER_SCHEME, chatEditingAgentSupportsReadonlyReferencesContextKey, chatEditingResourceContextKey, chatEditingWidgetFileReadonlyContextKey, chatEditingWidgetFileStateContextKey, decidedChatEditingResourceContextKey, hasAppliedChatEditsContextKey, hasUndecidedChatEditingResourceContextKey, IChatEditingService, IChatEditingSession, WorkingSetEntryRemovalReason, WorkingSetEntryState } from '../../common/chatEditingService.js';
 import { IChatService } from '../../common/chatService.js';
 import { isRequestVM, isResponseVM } from '../../common/chatViewModel.js';
 import { CHAT_CATEGORY } from '../actions/chatActions.js';
@@ -56,6 +63,35 @@ abstract class WorkingSetAction extends Action2 {
 
 	abstract runWorkingSetAction(accessor: ServicesAccessor, currentEditingSession: IChatEditingSession, chatWidget: IChatWidget | undefined, ...uris: URI[]): any;
 }
+
+registerAction2(class MarkFileAsReadonly extends WorkingSetAction {
+	constructor() {
+		super({
+			id: 'chatEditing.markFileAsReadonly',
+			title: localize2('markFileAsReadonly', 'Mark as read-only'),
+			icon: Codicon.lock,
+			toggled: chatEditingWidgetFileReadonlyContextKey,
+			menu: [{
+				id: MenuId.ChatEditingWidgetModifiedFilesToolbar,
+				when: ContextKeyExpr.and(
+					chatEditingAgentSupportsReadonlyReferencesContextKey,
+					ContextKeyExpr.or(
+						ContextKeyExpr.equals(chatEditingWidgetFileReadonlyContextKey.key, true),
+						ContextKeyExpr.equals(chatEditingWidgetFileReadonlyContextKey.key, false),
+					)
+				),
+				order: 10,
+				group: 'navigation'
+			}],
+		});
+	}
+
+	async runWorkingSetAction(_accessor: ServicesAccessor, currentEditingSession: IChatEditingSession, _chatWidget: IChatWidget, ...uris: URI[]): Promise<void> {
+		for (const uri of uris) {
+			currentEditingSession.markIsReadonly(uri);
+		}
+	}
+});
 
 registerAction2(class AddFileToWorkingSet extends WorkingSetAction {
 	constructor() {
@@ -95,12 +131,39 @@ registerAction2(class RemoveFileFromWorkingSet extends WorkingSetAction {
 	}
 
 	async runWorkingSetAction(accessor: ServicesAccessor, currentEditingSession: IChatEditingSession, chatWidget: IChatWidget, ...uris: URI[]): Promise<void> {
+		const dialogService = accessor.get(IDialogService);
+
+		const pendingEntries = currentEditingSession.entries.get().filter((entry) => uris.includes(entry.modifiedURI) && entry.state.get() === WorkingSetEntryState.Modified);
+		if (pendingEntries.length > 0) {
+			// Ask for confirmation if there are any pending edits
+			const file = pendingEntries.length > 1
+				? localize('chat.editing.removeFile.confirmationmanyFiles', "{0} files", pendingEntries.length)
+				: basename(pendingEntries[0].modifiedURI);
+			const confirmation = await dialogService.confirm({
+				title: localize('chat.editing.removeFile.confirmation.title', "Remove {0} from working set?", file),
+				message: localize('chat.editing.removeFile.confirmation.message', "This will remove {0} from your working set and undo the edits made to it. Do you want to proceed?", file),
+				primaryButton: localize('chat.editing.removeFile.confirmation.primaryButton', "Yes"),
+				type: 'info'
+			});
+			if (!confirmation.confirmed) {
+				return;
+			}
+		}
+
 		// Remove from working set
+		await currentEditingSession.reject(...uris);
 		currentEditingSession.remove(WorkingSetEntryRemovalReason.User, ...uris);
 
 		// Remove from chat input part
 		for (const uri of uris) {
 			chatWidget.attachmentModel.delete(uri.toString());
+		}
+
+		// If there are now only suggested files in the working set, also clear those
+		const entries = [...currentEditingSession.workingSet.entries()];
+		const suggestedFiles = entries.filter(([_, state]) => state.state === WorkingSetEntryState.Suggested);
+		if (suggestedFiles.length === entries.length && !chatWidget.attachmentModel.attachments.find((v) => v.isFile && URI.isUri(v.value))) {
+			currentEditingSession.remove(WorkingSetEntryRemovalReason.Programmatic, ...entries.map(([uri,]) => uri));
 		}
 	}
 });
@@ -123,7 +186,7 @@ registerAction2(class OpenFileInDiffAction extends WorkingSetAction {
 	async runWorkingSetAction(accessor: ServicesAccessor, currentEditingSession: IChatEditingSession, _chatWidget: IChatWidget, ...uris: URI[]): Promise<void> {
 		const editorService = accessor.get(IEditorService);
 		for (const uri of uris) {
-			const editedFile = currentEditingSession.entries.get().find((e) => e.modifiedURI.toString() === uri.toString());
+			const editedFile = currentEditingSession.getEntry(uri);
 			if (editedFile?.state.get() === WorkingSetEntryState.Modified) {
 				await editorService.openEditor({
 					original: { resource: URI.from(editedFile.originalURI, true) },
@@ -324,11 +387,9 @@ export class ChatEditingRemoveAllFilesAction extends Action2 {
 		// Remove all file attachments
 		const attachmentModel = chatWidget?.attachmentModel as EditsAttachmentModel | undefined;
 		const fileAttachments = attachmentModel ? [...attachmentModel.excludedFileAttachments, ...attachmentModel.fileAttachments] : [];
-		for (const uri of fileAttachments) {
-			if (URI.isUri(uri.value)) {
-				chatWidget?.attachmentModel.delete(uri.value.toString());
-			}
-		}
+
+		const attachmentIdsToRemove = fileAttachments.map(attachment => (attachment.value as URI).toString());
+		chatWidget?.attachmentModel.delete(...attachmentIdsToRemove);
 	}
 }
 registerAction2(ChatEditingRemoveAllFilesAction);
@@ -450,9 +511,19 @@ registerAction2(class RemoveAction extends Action2 {
 			return;
 		}
 
+
+
+		const configurationService = accessor.get(IConfigurationService);
+		const dialogService = accessor.get(IDialogService);
+		const chatEditingService = accessor.get(IChatEditingService);
 		const chatService = accessor.get(IChatService);
 		const chatModel = chatService.getSession(item.sessionId);
 		if (chatModel?.initialLocation !== ChatAgentLocation.EditingSession) {
+			return;
+		}
+
+		const session = chatEditingService.currentEditingSession;
+		if (!session) {
 			return;
 		}
 
@@ -460,9 +531,6 @@ registerAction2(class RemoveAction extends Action2 {
 			isResponseVM(item) ? item.requestId : undefined;
 
 		if (requestId) {
-			const configurationService = accessor.get(IConfigurationService);
-			const dialogService = accessor.get(IDialogService);
-			const chatEditingService = accessor.get(IChatEditingService);
 			const chatRequests = chatModel.getRequests();
 			const itemIndex = chatRequests.findIndex(request => request.id === requestId);
 			const editsToUndo = chatRequests.length - itemIndex;
@@ -509,7 +577,7 @@ registerAction2(class RemoveAction extends Action2 {
 
 			// Restore the snapshot to what it was before the request(s) that we deleted
 			const snapshotRequestId = chatRequests[itemIndex].id;
-			await chatEditingService.restoreSnapshot(snapshotRequestId);
+			await session.restoreSnapshot(snapshotRequestId);
 
 			// Remove the request and all that come after it
 			for (const request of requestsToRemove) {
@@ -526,11 +594,11 @@ registerAction2(class OpenWorkingSetHistoryAction extends Action2 {
 		super({
 			id: OpenWorkingSetHistoryAction.id,
 			title: localize('chat.openSnapshot.label', "Open File Snapshot"),
+			precondition: ContextKeyExpr.notIn(ChatContextKeys.itemId.key, ChatContextKeys.lastItemId.key),
 			menu: [{
 				id: MenuId.ChatEditingCodeBlockContext,
 				group: 'navigation',
 				order: 0,
-				when: ContextKeyExpr.notIn(ChatContextKeys.itemId.key, ChatContextKeys.lastItemId.key),
 			},]
 		});
 	}
@@ -556,7 +624,7 @@ registerAction2(class OpenWorkingSetHistoryAction extends Action2 {
 		}
 		const snapshotRequestId = requests[snapshotRequestIndex]?.id;
 		if (snapshotRequestId) {
-			const snapshot = chatEditingService.getSnapshotUri(snapshotRequestId, context.uri);
+			const snapshot = chatEditingService.currentEditingSession?.getSnapshotUri(snapshotRequestId, context.uri);
 			if (snapshot) {
 				const editor = await editorService.openEditor({ resource: snapshot, label: localize('chatEditing.snapshot', '{0} (Snapshot {1})', basename(context.uri), snapshotRequestIndex - 1), options: { transient: true, activation: EditorActivation.ACTIVATE } });
 				if (isCodeEditor(editor)) {
@@ -564,5 +632,87 @@ registerAction2(class OpenWorkingSetHistoryAction extends Action2 {
 				}
 			}
 		}
+	}
+});
+
+registerAction2(class ResolveSymbolsContextAction extends Action2 {
+	constructor() {
+		super({
+			id: 'workbench.action.edits.addFilesFromReferences',
+			title: localize2('addFilesFromReferences', "Add Files From References"),
+			f1: false,
+			category: CHAT_CATEGORY,
+			menu: {
+				id: MenuId.ChatInputSymbolAttachmentContext,
+				group: 'navigation',
+				order: 1,
+				when: ContextKeyExpr.and(ChatContextKeys.location.isEqualTo(ChatAgentLocation.EditingSession), EditorContextKeys.hasReferenceProvider)
+			}
+		});
+	}
+
+	override async run(accessor: ServicesAccessor, ...args: any[]): Promise<void> {
+		const widgetService = accessor.get(IChatWidgetService);
+		const textModelService = accessor.get(ITextModelService);
+		const languageFeaturesService = accessor.get(ILanguageFeaturesService);
+		const [widget] = widgetService.getWidgetsByLocations(ChatAgentLocation.EditingSession);
+		if (!widget || args.length === 0 || !isLocation(args[0])) {
+			return;
+		}
+
+		const symbol = args[0] as Location;
+
+		const modelReference = await textModelService.createModelReference(symbol.uri);
+		const textModel = modelReference.object.textEditorModel;
+		if (!textModel) {
+			return;
+		}
+
+		const position = new Position(symbol.range.startLineNumber, symbol.range.startColumn);
+
+		const [references, definitions, implementations] = await Promise.all([
+			this.getReferences(position, textModel, languageFeaturesService),
+			this.getDefinitions(position, textModel, languageFeaturesService),
+			this.getImplementations(position, textModel, languageFeaturesService)
+		]);
+
+		// Sort the references, definitions and implementations by
+		// how important it is that they make it into the working set as it has limited size
+		const attachments = [];
+		for (const reference of [...definitions, ...implementations, ...references]) {
+			attachments.push(widget.attachmentModel.asVariableEntry(reference.uri));
+		}
+
+		widget.attachmentModel.addContext(...attachments);
+	}
+
+	private async getReferences(position: Position, textModel: ITextModel, languageFeaturesService: ILanguageFeaturesService): Promise<Location[]> {
+		const referenceProviders = languageFeaturesService.referenceProvider.all(textModel);
+
+		const references = await Promise.all(referenceProviders.map(async (referenceProvider) => {
+			return await referenceProvider.provideReferences(textModel, position, { includeDeclaration: true }, CancellationToken.None) ?? [];
+		}));
+
+		return references.flat();
+	}
+
+	private async getDefinitions(position: Position, textModel: ITextModel, languageFeaturesService: ILanguageFeaturesService): Promise<Location[]> {
+		const definitionProviders = languageFeaturesService.definitionProvider.all(textModel);
+
+		const definitions = await Promise.all(definitionProviders.map(async (definitionProvider) => {
+			return await definitionProvider.provideDefinition(textModel, position, CancellationToken.None) ?? [];
+		}));
+
+		return definitions.flat();
+	}
+
+	private async getImplementations(position: Position, textModel: ITextModel, languageFeaturesService: ILanguageFeaturesService): Promise<Location[]> {
+		const implementationProviders = languageFeaturesService.implementationProvider.all(textModel);
+
+		const implementations = await Promise.all(implementationProviders.map(async (implementationProvider) => {
+			return await implementationProvider.provideImplementation(textModel, position, CancellationToken.None) ?? [];
+		}));
+
+		return implementations.flat();
 	}
 });

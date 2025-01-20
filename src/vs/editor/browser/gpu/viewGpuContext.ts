@@ -19,9 +19,11 @@ import { GPULifecycle } from './gpuDisposable.js';
 import { ensureNonNullable, observeDevicePixelDimensions } from './gpuUtils.js';
 import { RectangleRenderer } from './rectangleRenderer.js';
 import type { ViewContext } from '../../common/viewModel/viewContext.js';
-import { DecorationCssRuleExtractor } from './decorationCssRuleExtractor.js';
+import { DecorationCssRuleExtractor } from './css/decorationCssRuleExtractor.js';
 import { Event } from '../../../base/common/event.js';
-import type { IEditorOptions } from '../../common/config/editorOptions.js';
+import { EditorOption, type IEditorOptions } from '../../common/config/editorOptions.js';
+import { InlineDecorationType } from '../../common/viewModel.js';
+import { DecorationStyleCache } from './css/decorationStyleCache.js';
 
 const enum GpuRenderLimits {
 	maxGpuLines = 3000,
@@ -44,13 +46,19 @@ export class ViewGpuContext extends Disposable {
 	readonly canvas: FastDomNode<HTMLCanvasElement>;
 	readonly ctx: GPUCanvasContext;
 
-	readonly device: Promise<GPUDevice>;
+	static device: Promise<GPUDevice>;
+	static deviceSync: GPUDevice | undefined;
 
 	readonly rectangleRenderer: RectangleRenderer;
 
 	private static readonly _decorationCssRuleExtractor = new DecorationCssRuleExtractor();
 	static get decorationCssRuleExtractor(): DecorationCssRuleExtractor {
 		return ViewGpuContext._decorationCssRuleExtractor;
+	}
+
+	private static readonly _decorationStyleCache = new DecorationStyleCache();
+	static get decorationStyleCache(): DecorationStyleCache {
+		return ViewGpuContext._decorationStyleCache;
 	}
 
 	private static _atlas: TextureAtlas | undefined;
@@ -78,6 +86,7 @@ export class ViewGpuContext extends Disposable {
 
 	readonly canvasDevicePixelDimensions: IObservable<{ width: number; height: number }>;
 	readonly devicePixelRatio: IObservable<number>;
+	readonly contentLeft: IObservable<number>;
 
 	constructor(
 		context: ViewContext,
@@ -101,20 +110,23 @@ export class ViewGpuContext extends Disposable {
 
 		this.ctx = ensureNonNullable(this.canvas.domNode.getContext('webgpu'));
 
-		this.device = GPULifecycle.requestDevice((message) => {
-			const choices: IPromptChoice[] = [{
-				label: nls.localize('editor.dom.render', "Use DOM-based rendering"),
-				run: () => this.configurationService.updateValue('editor.experimentalGpuAcceleration', 'off'),
-			}];
-			this._notificationService.prompt(Severity.Warning, message, choices);
-		}).then(ref => this._register(ref).object);
-		this.device.then(device => {
-			if (!ViewGpuContext._atlas) {
-				ViewGpuContext._atlas = this._instantiationService.createInstance(TextureAtlas, device.limits.maxTextureDimension2D, undefined);
-			}
-		});
-
-		this.rectangleRenderer = this._instantiationService.createInstance(RectangleRenderer, context, this.canvas.domNode, this.ctx, this.device);
+		// Request the GPU device, we only want to do this a single time per window as it's async
+		// and can delay the initial render.
+		if (!ViewGpuContext.device) {
+			ViewGpuContext.device = GPULifecycle.requestDevice((message) => {
+				const choices: IPromptChoice[] = [{
+					label: nls.localize('editor.dom.render', "Use DOM-based rendering"),
+					run: () => this.configurationService.updateValue('editor.experimentalGpuAcceleration', 'off'),
+				}];
+				this._notificationService.prompt(Severity.Warning, message, choices);
+			}).then(ref => {
+				ViewGpuContext.deviceSync = ref.object;
+				if (!ViewGpuContext._atlas) {
+					ViewGpuContext._atlas = this._instantiationService.createInstance(TextureAtlas, ref.object.limits.maxTextureDimension2D, undefined);
+				}
+				return ref.object;
+			});
+		}
 
 		const dprObs = observableValue(this, getActiveWindow().devicePixelRatio);
 		this._register(addDisposableListener(getActiveWindow(), 'resize', () => {
@@ -134,6 +146,14 @@ export class ViewGpuContext extends Disposable {
 			}
 		));
 		this.canvasDevicePixelDimensions = canvasDevicePixelDimensions;
+
+		const contentLeft = observableValue(this, 0);
+		this._register(this.configurationService.onDidChangeConfiguration(e => {
+			contentLeft.set(context.configuration.options.get(EditorOption.layoutInfo).contentLeft, undefined);
+		}));
+		this.contentLeft = contentLeft;
+
+		this.rectangleRenderer = this._instantiationService.createInstance(RectangleRenderer, context, this.contentLeft, this.devicePixelRatio, this.canvas.domNode, this.ctx, ViewGpuContext.device);
 	}
 
 	/**
@@ -148,7 +168,6 @@ export class ViewGpuContext extends Disposable {
 		if (
 			data.containsRTL ||
 			data.maxColumn > GpuRenderLimits.maxGpuCols ||
-			data.continuesWithWrappedLine ||
 			lineNumber >= GpuRenderLimits.maxGpuLines
 		) {
 			return false;
@@ -158,6 +177,10 @@ export class ViewGpuContext extends Disposable {
 		if (data.inlineDecorations.length > 0) {
 			let supported = true;
 			for (const decoration of data.inlineDecorations) {
+				if (decoration.type !== InlineDecorationType.Regular) {
+					supported = false;
+					break;
+				}
 				const styleRules = ViewGpuContext._decorationCssRuleExtractor.getStyleRules(this.canvas.domNode, decoration.inlineClassName);
 				supported &&= styleRules.every(rule => {
 					// Pseudo classes aren't supported currently
@@ -165,7 +188,7 @@ export class ViewGpuContext extends Disposable {
 						return false;
 					}
 					for (const r of rule.style) {
-						if (!gpuSupportedDecorationCssRules.includes(r)) {
+						if (!supportsCssRule(r, rule.style)) {
 							return false;
 						}
 					}
@@ -193,14 +216,17 @@ export class ViewGpuContext extends Disposable {
 		if (data.maxColumn > GpuRenderLimits.maxGpuCols) {
 			reasons.push('maxColumn > maxGpuCols');
 		}
-		if (data.continuesWithWrappedLine) {
-			reasons.push('continuesWithWrappedLine');
-		}
 		if (data.inlineDecorations.length > 0) {
 			let supported = true;
+			const problemTypes: InlineDecorationType[] = [];
 			const problemSelectors: string[] = [];
 			const problemRules: string[] = [];
 			for (const decoration of data.inlineDecorations) {
+				if (decoration.type !== InlineDecorationType.Regular) {
+					problemTypes.push(decoration.type);
+					supported = false;
+					continue;
+				}
 				const styleRules = ViewGpuContext._decorationCssRuleExtractor.getStyleRules(this.canvas.domNode, decoration.inlineClassName);
 				supported &&= styleRules.every(rule => {
 					// Pseudo classes aren't supported currently
@@ -209,22 +235,25 @@ export class ViewGpuContext extends Disposable {
 						return false;
 					}
 					for (const r of rule.style) {
-						if (!gpuSupportedDecorationCssRules.includes(r)) {
-							problemRules.push(r);
+						if (!supportsCssRule(r, rule.style)) {
+							problemRules.push(`${r}: ${rule.style[r as any]}`);
 							return false;
 						}
 					}
 					return true;
 				});
 				if (!supported) {
-					break;
+					continue;
 				}
 			}
+			if (problemTypes.length > 0) {
+				reasons.push(`inlineDecorations with unsupported types (${problemTypes.map(e => `\`${e}\``).join(', ')})`);
+			}
 			if (problemRules.length > 0) {
-				reasons.push(`inlineDecorations with unsupported CSS rules (\`${problemRules.join(', ')}\`)`);
+				reasons.push(`inlineDecorations with unsupported CSS rules (${problemRules.map(e => `\`${e}\``).join(', ')})`);
 			}
 			if (problemSelectors.length > 0) {
-				reasons.push(`inlineDecorations with unsupported CSS selectors (\`${problemSelectors.join(', ')}\`)`);
+				reasons.push(`inlineDecorations with unsupported CSS selectors (${problemSelectors.map(e => `\`${e}\``).join(', ')})`);
 			}
 		}
 		if (lineNumber >= GpuRenderLimits.maxGpuLines) {
@@ -235,8 +264,20 @@ export class ViewGpuContext extends Disposable {
 }
 
 /**
- * A list of fully supported decoration CSS rules that can be used in the GPU renderer.
+ * A list of supported decoration CSS rules that can be used in the GPU renderer.
  */
 const gpuSupportedDecorationCssRules = [
 	'color',
+	'font-weight',
+	'opacity',
 ];
+
+function supportsCssRule(rule: string, style: CSSStyleDeclaration) {
+	if (!gpuSupportedDecorationCssRules.includes(rule)) {
+		return false;
+	}
+	// Check for values that aren't supported
+	switch (rule) {
+		default: return true;
+	}
+}
